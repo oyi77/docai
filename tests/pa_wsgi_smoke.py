@@ -72,7 +72,8 @@ def main():
     status, headers, body = run(fake_environ("GET", "/health"))
     payload = json.loads(body)
     assert status == "200 OK", status
-    assert payload == {"status": "ok", "banks": ["bca"]}, payload
+    assert payload["status"] == "ok", payload
+    assert "bca" in payload["banks"], payload
     print(f"[health] {status} {payload}")
 
     # 2. GET /

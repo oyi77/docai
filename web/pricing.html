@@ -259,6 +259,19 @@
 </footer>
 
 <script>
+// --- Midtrans Snap checkout ---
+// Load Snap JS dynamically based on environment
+(function() {
+  var script = document.createElement('script');
+  // Sandbox by default; set data-env="production" on the <script> tag for prod
+  var isProd = document.currentScript && document.currentScript.getAttribute('data-env') === 'production';
+  script.src = isProd
+    ? 'https://app.midtrans.com/snap/snap.js'
+    : 'https://app.sandbox.midtrans.com/snap/snap.js';
+  script.setAttribute('data-client-key', '');
+  document.head.appendChild(script);
+})();
+
 function startCheckout(tier) {
   var email = prompt('Enter your email address to subscribe:');
   if (!email || !email.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)) {
@@ -266,15 +279,33 @@ function startCheckout(tier) {
     return;
   }
   var apiKey = localStorage.getItem('docai_api_key') || '';
-  fetch('/create-checkout-session', {
+
+  // Step 1: Request a Snap token from our backend
+  fetch('/api/subscribe', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({tier: tier, email: email, api_key: apiKey})
   })
   .then(function(res) { return res.json(); })
   .then(function(data) {
-    if (data.checkout_url) {
-      window.location.href = data.checkout_url;
+    if (data.token) {
+      // Step 2: Open Midtrans Snap popup with the token
+      window.snap.pay(data.token, {
+        onSuccess: function(result) {
+          alert('Payment successful! Your plan has been upgraded to ' + (data.plan || tier) + '.');
+          // Redirect to success page
+          window.location.href = '/signup?upgraded=' + tier;
+        },
+        onPending: function(result) {
+          alert('Payment is pending. Please complete your payment.');
+        },
+        onError: function(result) {
+          alert('Payment failed. Please try again or contact support.');
+        },
+        onClose: function() {
+          // User closed the popup without completing
+        }
+      });
     } else {
       alert(data.message || data.error || 'Checkout failed. Please try again.');
     }

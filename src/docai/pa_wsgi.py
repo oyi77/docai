@@ -36,12 +36,20 @@ from docai.parsers.registry import get_parser, list_banks
 from docai.serialization import result_to_csv, result_to_dict
 from docai.validation import ValidationError, validate_statement
 
-# --- Stripe (optional, configured via env vars) ------------------------------
-
-try:
-    import stripe as _stripe  # type: ignore[import-untyped]
-except ImportError:
-    _stripe = None  # type: ignore[assignment]
+# --- Midtrans (configured via env vars) ------------------------------------
+#
+# MIDTRANS_MERCHANT_ID  — Midtrans Merchant ID (G166976201)
+# MIDTRANS_SERVER_KEY   — Midtrans server key (Secret or Basic auth)
+# MIDTRANS_CLIENT_KEY   — Midtrans client key (for Snap front-end)
+# MIDTRANS_IS_PRODUCTION — "true" for production, "false" (default) for sandbox
+# MIDTRANS_WEBHOOK_SECRET — SHA-512 signature verification key (defaults to server key)
+#
+# Sandbox:  https://api.sandbox.midtrans.com  |  https://app.sandbox.midtrans.com/snap/snap.js
+# Production: https://api.midtrans.com         |  https://app.midtrans.com/snap/snap.js
+#
+import hashlib
+import hmac as _hmac
+import base64 as _b64
 
 WEB_DIR = Path(__file__).resolve().parent.parent.parent / "web"
 _USAGE_FILE = Path(__file__).resolve().parent / "usage.json"
@@ -64,7 +72,7 @@ API_KEYS: dict[str, dict] = {
     "docai-dev-key-12345": {"tier": "free", "name": "Development"},
 }
 
-_EXEMPT_PATHS = frozenset({"/health", "/", "/docs", "/openapi.json", "/signup", "/contact", "/create-checkout-session", "/stripe-webhook", "/customer-portal"})
+_EXEMPT_PATHS = frozenset({"/health", "/", "/docs", "/openapi.json", "/signup", "/contact", "/api/subscribe", "/api/midtrans-callback", "/api/billing-portal"})
 
 
 def _check_api_key(environ) -> None:
@@ -1359,28 +1367,168 @@ def _check_signup_rate(ip: str) -> bool:
     return True
 
 
-# --- Stripe Checkout ----------------------------------------------------------
+# --- Midtrans Subscription Billing --------------------------------------------
+#
+# Environment variables consumed:
+#   MIDTRANS_SERVER_KEY      — server key (secret / basic auth)
+#   MIDTRANS_CLIENT_KEY      — client key (for Snap front-end token)
+#   MIDTRANS_IS_PRODUCTION   — "true" | "false" (default sandbox)
+#   MIDTRANS_WEBHOOK_SECRET  — SHA-512 signature key for callback verification
+#   MIDTRANS_RECURRING_API   — "true" to use Midtrans Recurring API for subscriptions
+#
+import hashlib as _hashlib
+import hmac as _hmac
+import base64 as _b64
+import uuid as _uuid
 
-_STRIPE_PRICE_MAP = {
-    "starter": os.environ.get("STRIPE_PRICE_STARTER", "price_starter_monthly"),
-    "growth": os.environ.get("STRIPE_PRICE_GROWTH", "price_growth_monthly"),
-    "scale": os.environ.get("STRIPE_PRICE_SCALE", "price_scale_monthly"),
+# ── Midtrans helpers ─────────────────────────────────────────────────────────
+
+def _midtrans_base_url() -> str:
+    """Return Midtrans API base URL depending on sandbox / production."""
+    if os.environ.get("MIDTRANS_IS_PRODUCTION", "false").lower() == "true":
+        return "https://api.midtrans.com"
+    return "https://api.sandbox.midtrans.com"
+
+
+def _midtrans_snap_url() -> str:
+    """Return Midtrans Snap JS URL for the front-end."""
+    if os.environ.get("MIDTRANS_IS_PRODUCTION", "false").lower() == "true":
+        return "https://app.midtrans.com/snap/snap.js"
+    return "https://app.sandbox.midtrans.com/snap/snap.js"
+
+
+def _midtrans_server_key() -> str:
+    """Return the Midtrans server key (empty string if unset)."""
+    return os.environ.get("MIDTRANS_SERVER_KEY", "")
+
+
+def _midtrans_client_key() -> str:
+    """Return the Midtrans client key (empty string if unset)."""
+    return os.environ.get("MIDTRANS_CLIENT_KEY", "")
+
+
+def _midtrans_webhook_secret() -> str:
+    """Return the Midtrans webhook signature key (empty string if unset).
+
+    Per Midtrans docs, the webhook signature uses SHA-512 of
+    (order_id + status_code + gross_amount + SERVER_KEY).
+    Falls back to MIDTRANS_SERVER_KEY when MIDTRANS_WEBHOOK_SECRET is unset.
+    """
+    return os.environ.get("MIDTRANS_WEBHOOK_SECRET", "") or _midtrans_server_key()
+
+
+# ── Subscription plan mapping ────────────────────────────────────────────────
+#
+# Prices are in IDR (Indonesian Rupiah). Midtrans handles currency.
+# quota: monthly API call limit (-1 = unlimited)
+
+MIDTRANS_PLANS = {
+    "starter": {
+        "plan_id": "docai-starter",
+        "name": "Starter",
+        "price": 500_000,       # Rp 500,000/month
+        "quota": 1_000,
+    },
+    "growth": {
+        "plan_id": "docai-growth",
+        "name": "Growth",
+        "price": 5_000_000,     # Rp 5,000,000/month
+        "quota": 10_000,
+    },
+    "scale": {
+        "plan_id": "docai-scale",
+        "name": "Scale",
+        "price": 30_000_000,    # Rp 30,000,000/month
+        "quota": -1,            # unlimited
+    },
 }
 
+# ── Subscription store ───────────────────────────────────────────────────────
+# persisted alongside usage.json
 
-def _get_stripe_key():
-    """Get Stripe secret key from environment, or None if not configured."""
-    return os.environ.get("STRIPE_SECRET_KEY")
+_SUBSCRIPTIONS_FILE = Path(__file__).resolve().parent / "subscriptions.json"
 
 
-def _handle_create_checkout_session(environ, start_response):
-    """POST /create-checkout-session -- create a Stripe Checkout session."""
-    stripe_key = _get_stripe_key()
-    if not stripe_key or _stripe is None:
+def _load_subscriptions() -> dict:
+    """Load subscription data from subscriptions.json."""
+    try:
+        return json.loads(_SUBSCRIPTIONS_FILE.read_text("utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_subscriptions(data: dict) -> None:
+    """Write subscription data to subscriptions.json."""
+    _SUBSCRIPTIONS_FILE.write_text(json.dumps(data, indent=2), "utf-8")
+
+
+# ── Signature verification ───────────────────────────────────────────────────
+
+def _verify_midtrans_signature(body_bytes: bytes, signature: str) -> bool:
+    """Verify Midtrans callback signature using SHA-512.
+
+    Midtrans sends X-Signature header = SHA512(order_id + status_code + gross_amount + SERVER_KEY).
+    """
+    secret = _midtrans_webhook_secret()
+    if not secret:
+        return False
+    try:
+        data = json.loads(body_bytes)
+    except (json.JSONDecodeError, ValueError):
+        return False
+
+    order_id = str(data.get("order_id", ""))
+    status_code = str(data.get("status_code", ""))
+    gross_amount = str(data.get("gross_amount", ""))
+    body_str = order_id + status_code + gross_amount + secret
+    expected = _hashlib.sha512(body_str.encode("utf-8")).hexdigest()
+    return _hmac.compare_digest(expected, signature)
+
+
+# ── Midtrans API call helper ─────────────────────────────────────────────────
+
+def _midtrans_api_call(path: str, payload: dict) -> dict:
+    """Call Midtrans API and return parsed JSON response.
+
+    Uses basic auth with server key.
+    """
+    import urllib.request
+
+    server_key = _midtrans_server_key()
+    base = _midtrans_base_url()
+    url = f"{base}{path}"
+
+    body = json.dumps(payload).encode("utf-8")
+    auth_str = _b64.b64encode(f"{server_key}:".encode()).decode()
+
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Basic {auth_str}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+# ── Subscription handlers ────────────────────────────────────────────────────
+
+def _handle_subscribe(environ, start_response):
+    """POST /api/subscribe — create a Midtrans Snap transaction for subscription.
+
+    Input JSON:  {tier: "starter"|"growth"|"scale", email: string, api_key?: string}
+    Returns:     {subscription_id, payment_url, token}
+    """
+    server_key = _midtrans_server_key()
+    if not server_key:
         return _json_response(
             start_response,
             "503 Service Unavailable",
-            {"error": "stripe_not_configured", "message": "Stripe is not configured. Contact support to upgrade."},
+            {"error": "midtrans_not_configured", "message": "Midtrans is not configured. Contact support to upgrade."},
         )
 
     length = int(environ.get("CONTENT_LENGTH") or "0")
@@ -1402,10 +1550,10 @@ def _handle_create_checkout_session(environ, start_response):
     email = (data.get("email") or "").strip()
     api_key = (data.get("api_key") or "").strip()
 
-    if tier not in _STRIPE_PRICE_MAP:
+    if tier not in MIDTRANS_PLANS:
         return _json_response(
             start_response, "400 Bad Request",
-            {"error": "invalid_request", "message": f"Invalid tier: {tier}. Must be one of: {', '.join(_STRIPE_PRICE_MAP)}"},
+            {"error": "invalid_request", "message": f"Invalid tier: {tier}. Must be one of: {', '.join(MIDTRANS_PLANS)}"},
         )
     if not email or not _EMAIL_RE.match(email):
         return _json_response(
@@ -1413,86 +1561,155 @@ def _handle_create_checkout_session(environ, start_response):
             {"error": "invalid_request", "message": "Valid email is required"},
         )
 
-    _stripe.api_key = stripe_key
-    price_id = _STRIPE_PRICE_MAP[tier]
+    plan = MIDTRANS_PLANS[tier]
+    order_id = f"docai-{tier}-{_uuid.uuid4().hex[:12]}"
     host = environ.get("HTTP_HOST", "docaiid.pythonanywhere.com")
     scheme = "https"
 
+    # Build Snap transaction
+    snap_payload = {
+        "transaction_details": {
+            "order_id": order_id,
+            "gross_amount": plan["price"],
+        },
+        "customer_details": {
+            "email": email,
+        },
+        "item_details": [
+            {
+                "id": plan["plan_id"],
+                "name": f"DocAI Verify — {plan['name']} Plan",
+                "price": plan["price"],
+                "quantity": 1,
+            }
+        ],
+        "callbacks": {
+            "finish": f"{scheme}://{host}/pricing?status=success&order={order_id}",
+        },
+    }
+
+    # Store pending subscription
+    subs = _load_subscriptions()
+    subs[order_id] = {
+        "tier": tier,
+        "email": email,
+        "api_key": api_key,
+        "order_id": order_id,
+        "amount": plan["price"],
+        "status": "pending",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _save_subscriptions(subs)
+
     try:
-        session = _stripe.checkout.Session.create(
-            mode="subscription",
-            line_items=[{"price": price_id, "quantity": 1}],
-            customer_email=email,
-            metadata={"api_key": api_key, "tier": tier},
-            success_url=f"{scheme}://{host}/signup?upgraded={tier}",
-            cancel_url=f"{scheme}://{host}/pricing.html",
-        )
-        return _json_response(start_response, "200 OK", {
-            "checkout_url": session.url,
-            "session_id": session.id,
+        result = _midtrans_api_call("/v2/transaction", {
+            "transaction_details": snap_payload["transaction_details"],
+            "customer_details": snap_payload.get("customer_details"),
+            "item_details": snap_payload.get("item_details"),
         })
-    except _stripe.error.StripeError as e:
+
+        snap_token = result.get("token", "")
+        redirect_url = result.get("redirect_url", "")
+
+        if not snap_token:
+            return _json_response(
+                start_response, "502 Bad Gateway",
+                {"error": "midtrans_error", "message": result.get("status_message", "No token returned"), "details": result},
+            )
+
+        return _json_response(start_response, "200 OK", {
+            "subscription_id": order_id,
+            "payment_url": redirect_url,
+            "token": snap_token,
+            "plan": tier,
+            "amount": plan["price"],
+        })
+    except Exception as e:  # noqa: BLE001
         return _json_response(
-            start_response, "500 Internal Server Error",
-            {"error": "stripe_error", "message": str(e)},
+            start_response, "502 Bad Gateway",
+            {"error": "midtrans_error", "message": f"Midtrans API call failed: {e}"},
         )
 
 
-def _handle_stripe_webhook(environ, start_response):
-    """POST /stripe-webhook -- handle Stripe webhook events."""
-    stripe_key = _get_stripe_key()
-    webhook_secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
-    if not stripe_key or not webhook_secret or _stripe is None:
-        return _json_response(
-            start_response,
-            "503 Service Unavailable",
-            {"error": "stripe_not_configured", "message": "Stripe webhook not configured."},
-        )
+def _handle_midtrans_callback(environ, start_response):
+    """POST /api/midtrans-callback — Midtrans payment notification webhook.
 
+    Handles events:
+      - capture / settlement  → activate subscription
+      - cancel / deny / expire / failure → mark failed
+      - pending → no action
+
+    Verifies X-Signature header from Midtrans.
+    Does NOT require API key auth (it's a server-to-server webhook).
+    """
+    # Verify webhook signature
+    sig_header = environ.get("HTTP_X_SIGNATURE", "")
     length = int(environ.get("CONTENT_LENGTH") or "0")
     raw = environ["wsgi.input"].read(length)
-    sig_header = environ.get("HTTP_STRIPE_SIGNATURE", "")
 
-    try:
-        event = _stripe.Webhook.construct_event(raw, sig_header, webhook_secret)
-    except (ValueError, _stripe.error.SignatureVerificationError) as e:
+    if _midtrans_webhook_secret() and not _verify_midtrans_signature(raw, sig_header):
         return _json_response(
-            start_response, "400 Bad Request",
-            {"error": "invalid_webhook", "message": f"Webhook verification failed: {e}"},
+            start_response, "403 Forbidden",
+            {"error": "invalid_signature", "message": "Midtrans signature verification failed"},
         )
 
-    if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        api_key = (session.get("metadata") or {}).get("api_key")
-        tier = (session.get("metadata") or {}).get("tier")
-        if api_key and tier and tier in TIER_LIMITS:
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return _json_response(
+            start_response, "400 Bad Request",
+            {"error": "invalid_request", "message": "Invalid JSON"},
+        )
+
+    order_id = data.get("order_id", "")
+    transaction_status = data.get("transaction_status", "")
+    fraud_status = data.get("fraud_status", "")
+    status_code = str(data.get("status_code", ""))
+
+    subs = _load_subscriptions()
+    sub = subs.get(order_id)
+
+    if not sub:
+        return _json_response(start_response, "200 OK", {"received": True, "status": "unknown_order"})
+
+    tier = sub.get("tier", "")
+    api_key = sub.get("api_key", "")
+
+    # Map Midtrans status to our subscription status
+    if transaction_status in ("capture", "settlement") and fraud_status == "accept":
+        sub["status"] = "active"
+        sub["activated_at"] = datetime.now(timezone.utc).isoformat()
+        # Upgrade the API key tier
+        if api_key and tier in MIDTRANS_PLANS:
             usage = _load_usage()
             if api_key in usage:
                 usage[api_key]["tier"] = tier
                 _save_usage(usage)
-
-    elif event["type"] == "customer.subscription.deleted":
-        session = event["data"]["object"]
-        api_key = (session.get("metadata") or {}).get("api_key")
-        if api_key:
+    elif transaction_status in ("cancel", "deny", "expire", "failure"):
+        sub["status"] = "failed"
+        sub["failed_at"] = datetime.now(timezone.utc).isoformat()
+        # Downgrade to free if was previously active
+        if api_key and sub.get("status") == "active":
             usage = _load_usage()
             if api_key in usage:
                 usage[api_key]["tier"] = "free"
                 _save_usage(usage)
+    elif transaction_status == "pending":
+        sub["status"] = "pending"
+    else:
+        sub["status"] = transaction_status
 
-    return _json_response(start_response, "200 OK", {"received": True})
+    subs[order_id] = sub
+    _save_subscriptions(subs)
+
+    return _json_response(start_response, "200 OK", {"received": True, "status": sub["status"]})
 
 
-def _handle_customer_portal(environ, start_response):
-    """GET /customer-portal?api_key=... -- create a Stripe customer portal session."""
-    stripe_key = _get_stripe_key()
-    if not stripe_key or _stripe is None:
-        return _json_response(
-            start_response,
-            "503 Service Unavailable",
-            {"error": "stripe_not_configured", "message": "Stripe is not configured."},
-        )
+def _handle_billing_portal(environ, start_response):
+    """GET /api/billing-portal — show subscription status for an API key.
 
+    Query params: api_key (required)
+    """
     qs = urllib.parse.parse_qs(environ.get("QUERY_STRING", ""))
     api_key = (qs.get("api_key", [""])[0]).strip()
     if not api_key:
@@ -1501,32 +1718,42 @@ def _handle_customer_portal(environ, start_response):
             {"error": "invalid_request", "message": "api_key query parameter is required"},
         )
 
+    subs = _load_subscriptions()
+    user_sub = None
+    for sid, s in subs.items():
+        if s.get("api_key") == api_key and s.get("status") == "active":
+            user_sub = s
+            break
+
     usage = _load_usage()
-    user_data = usage.get(api_key, {})
-    customer_id = user_data.get("stripe_customer_id")
-    if not customer_id:
-        return _json_response(
-            start_response, "404 Not Found",
-            {"error": "not_found", "message": "No Stripe subscription found for this API key"},
-        )
+    user_usage = usage.get(api_key, {})
 
-    _stripe.api_key = stripe_key
-    host = environ.get("HTTP_HOST", "docaiid.pythonanywhere.com")
-    scheme = "https"
-
-    try:
-        portal = _stripe.billing_portal.Session.create(
-            customer=customer_id,
-            return_url=f"{scheme}://{host}/pricing.html",
-        )
+    if not user_sub:
         return _json_response(start_response, "200 OK", {
-            "portal_url": portal.url,
+            "subscription": None,
+            "current_tier": user_usage.get("tier", "free"),
+            "message": "No active subscription found. Visit /pricing to subscribe.",
         })
-    except _stripe.error.StripeError as e:
-        return _json_response(
-            start_response, "500 Internal Server Error",
-            {"error": "stripe_error", "message": str(e)},
-        )
+
+    plan = MIDTRANS_PLANS.get(user_sub.get("tier", ""), {})
+
+    return _json_response(start_response, "200 OK", {
+        "subscription": {
+            "order_id": user_sub["order_id"],
+            "tier": user_sub["tier"],
+            "plan_name": plan.get("name", user_sub["tier"]),
+            "amount": user_sub.get("amount", 0),
+            "status": user_sub.get("status", "unknown"),
+            "created_at": user_sub.get("created_at", ""),
+            "activated_at": user_sub.get("activated_at"),
+        },
+        "current_tier": user_usage.get("tier", "free"),
+        "upgrade_plans": [
+            {"tier": t, "name": p["name"], "price": p["price"]}
+            for t, p in MIDTRANS_PLANS.items()
+            if t != user_sub.get("tier")
+        ],
+    })
 
 
 # --- WSGI application --------------------------------------------------------
@@ -1572,12 +1799,12 @@ def application(environ, start_response):
             return _handle_signup(environ, start_response)
         if path == "/contact" and method in ("GET", "POST"):
             return _handle_contact(environ, start_response)
-        if path == "/create-checkout-session" and method == "POST":
-            return _handle_create_checkout_session(environ, start_response)
-        if path == "/stripe-webhook" and method == "POST":
-            return _handle_stripe_webhook(environ, start_response)
-        if path == "/customer-portal" and method == "GET":
-            return _handle_customer_portal(environ, start_response)
+        if path == "/api/subscribe" and method == "POST":
+            return _handle_subscribe(environ, start_response)
+        if path == "/api/midtrans-callback" and method == "POST":
+            return _handle_midtrans_callback(environ, start_response)
+        if path == "/api/billing-portal" and method == "GET":
+            return _handle_billing_portal(environ, start_response)
         if path == "/docs" and method == "GET":
             return _handle_docs(environ, start_response)
         if path == "/openapi.json" and method == "GET":
